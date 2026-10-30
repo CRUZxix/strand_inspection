@@ -1,177 +1,118 @@
 import base64
+import hashlib
 import io
 import json
 import re
+from statistics import median
 
 import pandas as pd
 import streamlit as st
 from openai import OpenAI
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-# Page configuration
-st.set_page_config(
-    page_title="Packet Strand Inspection",
-    page_icon="🔎",
-    layout="wide",
-)
+st.set_page_config(page_title="Packet Strand Inspection", page_icon="🔎", layout="wide")
 
-# Custom styles for clean, modern cards and layout
-st.html(
-    """
-    <style>
-    .matrix-container {
-        width: 100%;
-        max-width: 520px;
-        margin: 16px 0 24px 0;
-    }
-    .matrix-grid {
-        display: grid;
-        gap: 12px;
-        width: 100%;
-    }
-    .comp-card {
-        border-radius: 8px;
-        padding: 12px 8px;
-        text-align: center;
-        display: flex;
-        flex-direction: column;
-        justify-content: space-between;
-        align-items: center;
-        height: 115px;
-        box-sizing: border-box;
-        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
-        transition: transform 0.15s ease-in-out;
-    }
-    .comp-card:hover {
-        transform: translateY(-2px);
-    }
-    .card-id {
-        font-size: 13px;
-        font-weight: 700;
-        letter-spacing: 0.5px;
-        line-height: 1.2;
-    }
-    .card-count {
-        font-size: 36px;
-        font-weight: 800;
-        line-height: 1;
-        margin: 4px 0;
-    }
-    .card-status {
-        font-size: 12px;
-        font-weight: 700;
-        letter-spacing: 0.6px;
-        text-transform: uppercase;
-        line-height: 1.2;
-    }
-    /* GOOD: light green bg, dark green text */
-    .card-good {
-        background-color: #e8f5e9 !important;
-        color: #1b5e20 !important;
-        border: 1.5px solid #a5d6a7 !important;
-    }
-    /* DEFECT: light red bg, dark red text */
-    .card-defect {
-        background-color: #ffebee !important;
-        color: #b71c1c !important;
-        border: 1.5px solid #ef9a9a !important;
-    }
-    /* UNCERTAIN: light yellow bg, dark yellow text */
-    .card-uncertain {
-        background-color: #fffde7 !important;
-        color: #f57f17 !important;
-        border: 1.5px solid #fff59d !important;
-    }
-    </style>
-    """
-)
+st.html("""
+<style>
+.matrix-container{width:100%;margin:16px 0 24px}
+.matrix-grid{display:grid;gap:12px;width:100%}
+.comp-card{border-radius:10px;padding:12px 8px;text-align:center;display:flex;
+flex-direction:column;justify-content:space-between;align-items:center;min-height:112px;
+box-sizing:border-box;box-shadow:0 1px 3px rgba(0,0,0,.12)}
+.card-id{font-size:13px;font-weight:700;letter-spacing:.4px}
+.card-count{font-size:34px;font-weight:800;line-height:1.1;margin:5px 0}
+.card-status{font-size:12px;font-weight:700;letter-spacing:.5px}
+.card-good{background:#e8f5e9;color:#1b5e20;border:1.5px solid #a5d6a7}
+.card-defect{background:#ffebee;color:#b71c1c;border:1.5px solid #ef9a9a}
+.card-uncertain{background:#fffde7;color:#8a5a00;border:1.5px solid #ffe082}
+</style>
+""")
 
 st.title("🔎 Packet Strand Inspection")
-st.caption("AI-assisted visual component detection and strand-count quality inspection")
+st.caption("AI-assisted component localization and strand-count inspection")
 
-# -------------------- API KEY --------------------
 try:
-    API_KEY = st.secrets["OPENAI_API_KEY"]
+    API_KEY = st.secrets.get("OPENAI_API_KEY", "")
 except Exception:
     API_KEY = ""
-
-if not API_KEY or API_KEY == "PASTE_YOUR_API_KEY_HERE":
-    st.error("Configure OPENAI_API_KEY in .streamlit/secrets.toml, then restart the app.")
+if not API_KEY:
+    st.error("Configure OPENAI_API_KEY in .streamlit/secrets.toml.")
     st.stop()
-
 client = OpenAI(api_key=API_KEY)
 
 
-# -------------------- HELPERS --------------------
-def image_data_url(image, max_side=1600):
+def image_to_data_url(image, max_side=2400, quality=96):
     img = image.copy().convert("RGB")
-    img.thumbnail((max_side, max_side))
+    img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=90, optimize=True)
-    encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/jpeg;base64,{encoded}"
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
-def parse_json(text):
-    text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
+def parse_json_response(text):
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("The vision model returned an empty response.")
+    cleaned = re.sub(r"^\s*```(?:json)?\s*", "", text.strip(), flags=re.I)
+    cleaned = re.sub(r"\s*```\s*$", "", cleaned)
     try:
-        return json.loads(text)
+        data = json.loads(cleaned)
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if match:
-            return json.loads(match.group())
-        raise ValueError("Model response did not contain valid JSON.")
+        decoder, data = json.JSONDecoder(), None
+        for match in re.finditer(r"\{", cleaned):
+            try:
+                data, _ = decoder.raw_decode(cleaned[match.start():])
+                break
+            except json.JSONDecodeError:
+                continue
+        if data is None:
+            raise ValueError("Model response did not contain valid JSON.")
+    if not isinstance(data, dict):
+        raise ValueError("Expected a JSON object.")
+    return data
 
 
 def ask_vision(model_name, prompt, image):
     response = client.responses.create(
         model=model_name,
-        input=[{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": prompt},
-                {
-                    "type": "input_image",
-                    "image_url": image_data_url(image),
-                    "detail": "high",
-                },
-            ],
-        }],
+        input=[{"role": "user", "content": [
+            {"type": "input_text", "text": prompt},
+            {"type": "input_image", "image_url": image_to_data_url(image), "detail": "high"},
+        ]}],
     )
-    return parse_json(response.output_text)
+    return parse_json_response(response.output_text)
 
 
 def valid_box(box):
-    if not isinstance(box, list) or len(box) != 4:
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
         return False
     try:
-        x1, y1, x2, y2 = [float(v) for v in box]
+        x1, y1, x2, y2 = map(float, box)
     except (TypeError, ValueError):
         return False
-    return 0 <= x1 < x2 <= 1000 and 0 <= y1 < y2 <= 1000
+    return all(0 <= v <= 1000 for v in (x1, y1, x2, y2)) and x1 < x2 and y1 < y2
 
 
 def box_to_pixels(box, width, height):
-    x1, y1, x2, y2 = box
+    x1, y1, x2, y2 = map(float, box)
     return (
-        max(0, int(x1 * width / 1000)),
-        max(0, int(y1 * height / 1000)),
-        min(width, int(x2 * width / 1000)),
-        min(height, int(y2 * height / 1000)),
+        max(0, min(width, round(x1 * width / 1000))),
+        max(0, min(height, round(y1 * height / 1000))),
+        max(0, min(width, round(x2 * width / 1000))),
+        max(0, min(height, round(y2 * height / 1000))),
     )
 
 
-def crop_with_padding(image, px_box, padding=0.10):
+def crop_with_padding(image, px_box, padding=0.06):
     x1, y1, x2, y2 = px_box
-    dx = int((x2 - x1) * padding)
-    dy = int((y2 - y1) * padding)
-    x1 = max(0, x1 - dx)
-    y1 = max(0, y1 - dy)
-    x2 = min(image.width, x2 + dx)
-    y2 = min(image.height, y2 + dy)
-    return image.crop((x1, y1, x2, y2))
+    bw, bh = x2 - x1, y2 - y1
+    if bw < 2 or bh < 2:
+        raise ValueError("Detected component box is too small.")
+    dx, dy = max(3, round(bw * padding)), max(3, round(bh * padding))
+    crop = image.crop((max(0, x1-dx), max(0, y1-dy),
+                       min(image.width, x2+dx), min(image.height, y2+dy)))
+    if crop.width < 20 or crop.height < 20:
+        raise ValueError("Component crop is too small for reliable inspection.")
+    return crop
 
 
 def normalize_count(value):
@@ -179,457 +120,383 @@ def normalize_count(value):
         return "uncertain"
     if isinstance(value, int) and 0 <= value <= 5:
         return value
+    if isinstance(value, float) and value.is_integer() and 0 <= value <= 5:
+        return int(value)
     if isinstance(value, str):
-        v = value.strip().lower()
-        if v == "uncertain":
-            return "uncertain"
-        if v.isdigit() and 0 <= int(v) <= 5:
-            return int(v)
+        value = value.strip().lower()
+        if value == "uncertain":
+            return value
+        if value.isdigit() and 0 <= int(value) <= 5:
+            return int(value)
     return "uncertain"
 
 
-def assign_grid_positions(components):
-    """
-    Sorts detected components into rows (top to bottom) and columns (left to right)
-    without using fixed coordinates or manual margins.
-    """
-    enriched = []
-    for idx, c in enumerate(components):
-        b = c["bbox"]
-        cx = (b[0] + b[2]) / 2.0
-        cy = (b[1] + b[3]) / 2.0
-        h = b[3] - b[1]
-        enriched.append({"item": c, "cx": cx, "cy": cy, "h": h, "orig_idx": idx})
-
-    if not enriched:
-        return [], 0, 0
-
-    enriched.sort(key=lambda x: x["cy"])
-
-    avg_h = sum(x["h"] for x in enriched) / len(enriched)
-    row_threshold = avg_h * 0.45
-
-    rows = []
-    current_row = [enriched[0]]
-    for item in enriched[1:]:
-        if abs(item["cy"] - current_row[-1]["cy"]) < row_threshold:
-            current_row.append(item)
-        else:
-            rows.append(current_row)
-            current_row = [item]
-    rows.append(current_row)
-
-    ordered = []
-    for r_idx, row in enumerate(rows, start=1):
-        row.sort(key=lambda x: x["cx"])
-        for c_idx, item in enumerate(row, start=1):
-            comp = dict(item["item"])
-            comp["row"] = r_idx
-            comp["col"] = c_idx
-            comp["position"] = f"R{r_idx}C{c_idx}"
-            ordered.append(comp)
-
-    num_rows = len(rows)
-    num_cols = max(len(r) for r in rows) if rows else 0
-    return ordered, num_rows, num_cols
+def normalize_confidence(value):
+    value = str(value or "low").strip().lower()
+    return value if value in {"high", "medium", "low"} else "low"
 
 
-def detect_components(model_name, image, expected_count=10):
+def box_iou(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    iw = max(0, min(ax2, bx2) - max(ax1, bx1))
+    ih = max(0, min(ay2, by2) - max(ay1, by1))
+    inter = iw * ih
+    area_a = max(0, ax2-ax1) * max(0, ay2-ay1)
+    area_b = max(0, bx2-bx1) * max(0, by2-by1)
+    union = area_a + area_b - inter
+    return inter / union if union else 0.0
+
+
+def detect_components(model_name, image, expected_count):
     prompt = f"""
-You are performing visual localization on an industrial inspection photograph of a transparent plastic packet containing individual loop-shaped components.
-
-The packet contains approximately {expected_count} components arranged in rows and columns.
-Locate EVERY individual physical component inside the packet.
-
-Return ONLY a JSON object:
+Locate every separate physical loop-shaped component in this packet photograph.
+There are approximately {expected_count} components, but do not invent objects
+to reach that number. Return ONLY valid JSON:
 {{
-  "packet_bbox": [x1, y1, x2, y2],
-  "components": [
-    {{
-      "bbox": [x1, y1, x2, y2],
-      "confidence": "high"
-    }}
-  ],
-  "uncertainty_note": ""
+ "components":[{{"bbox":[x1,y1,x2,y2],"confidence":"high","note":""}}],
+ "uncertainty_note":""
 }}
-
-BOX COORDINATES:
-- Use normalized coordinates [x1, y1, x2, y2] from 0 to 1000.
-- [0, 0] is top-left, [1000, 1000] is bottom-right.
-- Each box must tightly enclose exactly one component (the entire loop including all strands).
-- Avoid unnecessary overlap, empty space, or capturing neighboring components.
-- Do NOT use hardcoded grid coordinates; locate the actual physical components.
-- Confidence must be "high", "medium", or "low".
+Coordinates are normalized 0-1000 relative to the FULL image, with [0,0] top-left
+and [1000,1000] bottom-right. bbox order is [left,top,right,bottom].
+Each box must tightly enclose exactly one complete visible component. Do not box
+packet edges, empty areas, shadows or reflections. Do not merge neighboring parts.
+Do not cut off visible parts. Confidence must be high, medium or low.
+If two components cannot be distinguished, explain this in uncertainty_note.
+Do not return a packet box. Do not create boxes just to satisfy the expected count.
 """
     data = ask_vision(model_name, prompt, image)
-    packet_box = data.get("packet_bbox")
-    if not valid_box(packet_box):
-        packet_box = None
-
-    components = []
-    for item in data.get("components", []):
-        if not isinstance(item, dict):
+    raw = data.get("components", [])
+    if not isinstance(raw, list):
+        raise ValueError("'components' in model response must be a list.")
+    components, rejected = [], 0
+    for item in raw:
+        if not isinstance(item, dict) or not valid_box(item.get("bbox")):
+            rejected += 1
             continue
-        box = item.get("bbox")
-        if not valid_box(box):
+        box = list(map(float, item["bbox"]))
+        if box[2]-box[0] < 15 or box[3]-box[1] < 15:
+            rejected += 1
             continue
-        conf = str(item.get("confidence", "low")).lower()
-        if conf not in ("high", "medium", "low"):
-            conf = "low"
         components.append({
-            "bbox": [float(v) for v in box],
-            "detection_confidence": conf,
+            "bbox": box,
+            "detection_confidence": normalize_confidence(item.get("confidence")),
+            "detection_note": str(item.get("note", ""))[:200],
+            "possible_duplicate": False,
         })
-
+    # Flag likely duplicate boxes; keep them visible for human review.
+    for i, comp in enumerate(components):
+        for previous in components[:i]:
+            if box_iou(comp["bbox"], previous["bbox"]) > 0.65:
+                comp["possible_duplicate"] = True
     return {
-        "packet_bbox": packet_box,
         "components": components,
         "notes": str(data.get("uncertainty_note", "")),
+        "rejected_boxes": rejected,
     }
 
 
-def count_single_component(model_name, crop, pos_label):
+def assign_grid_positions(components):
+    """Adaptive heuristic row grouping; warnings expose ambiguous layouts."""
+    if not components:
+        return [], 0, 0, []
+    items, heights = [], []
+    for comp in components:
+        x1, y1, x2, y2 = comp["bbox"]
+        heights.append(y2-y1)
+        items.append({"comp": comp, "cx": (x1+x2)/2, "cy": (y1+y2)/2})
+    tolerance = max(12.0, median(heights) * 0.42)
+    items.sort(key=lambda x: x["cy"])
+    rows = []
+    for item in items:
+        if not rows:
+            rows.append([item])
+            continue
+        center = median([entry["cy"] for entry in rows[-1]])
+        if abs(item["cy"]-center) <= tolerance:
+            rows[-1].append(item)
+        else:
+            rows.append([item])
+    ordered = []
+    row_sizes = []
+    for r, row in enumerate(rows, start=1):
+        row.sort(key=lambda x: x["cx"])
+        row_sizes.append(len(row))
+        for c, entry in enumerate(row, start=1):
+            comp = dict(entry["comp"])
+            comp.update({"row": r, "col": c, "position": f"R{r}C{c}"})
+            ordered.append(comp)
+    warnings = []
+    if len(set(row_sizes)) > 1:
+        warnings.append(f"Rows contain different component counts: {row_sizes}. Verify row assignment.")
+    return ordered, len(rows), max(row_sizes), warnings
+
+
+def count_single_component(model_name, crop, position):
     prompt = f"""
-Inspect this cropped photograph of component {pos_label} from the packet.
-Count how many physical strands (wires/filaments) form this loop.
-
-Valid strand counts are integers from 0 to 5. Five strands is a valid possible result.
-If the strands are obscured, overlapping ambiguously, or cannot be distinguished reliably, return "uncertain".
-
-Return ONLY JSON:
+Inspect ONE isolated component, identified as {position}. Count distinct physical
+strands forming this loop. Valid counts are 0,1,2,3,4,5 or "uncertain".
+Five is valid. Do not assume the expected count.
+Return ONLY valid JSON:
 {{
-  "strand_count": 4,
-  "visible_defects": "none",
-  "confidence": "high",
-  "uncertainty_reason": ""
+ "strand_count":4,
+ "confidence":"medium",
+ "visible_defects":[],
+ "uncertainty_reason":""
 }}
-
-Rules:
-- strand_count must be an integer 0-5 or "uncertain".
-- Describe visible defects only (e.g. broken strand, tangle, foreign material, or "none").
-- confidence must be "high", "medium", or "low".
-- Never invent counts or guess when strands cannot be distinguished.
+Count physical strands, not shadows, highlights, reflections or edges. Do not
+count one curved strand twice. If strands are obscured or cannot be separated,
+return uncertain. confidence must be high, medium or low.
+visible_defects must be a list containing only applicable values from:
+broken_strand, tangled, missing_strand, foreign_material, other.
+Only report defects clearly visible in this crop. Do not infer hidden defects.
 """
     data = ask_vision(model_name, prompt, crop)
-    count = normalize_count(data.get("strand_count", "uncertain"))
-    conf = str(data.get("confidence", "low")).lower()
-    if conf not in ("high", "medium", "low"):
-        conf = "low"
-    defects = str(data.get("visible_defects", "none")).strip()
-    reason = str(data.get("uncertainty_reason", "")).strip()
-
+    count = normalize_count(data.get("strand_count"))
+    confidence = normalize_confidence(data.get("confidence"))
+    defects = data.get("visible_defects", [])
+    allowed = {"broken_strand", "tangled", "missing_strand", "foreign_material", "other"}
+    if not isinstance(defects, list):
+        defects = []
+    defects = [str(v).strip().lower() for v in defects if str(v).strip().lower() in allowed]
     return {
         "strand_count": count,
+        "count_confidence": confidence,
         "visible_defects": defects,
-        "count_confidence": conf,
-        "uncertainty_reason": reason,
+        "uncertainty_reason": str(data.get("uncertainty_reason", ""))[:300],
     }
 
 
-def draw_annotated_image(source_image, components, results_dict=None):
-    """
-    Draws tight bounding boxes and compact badges on the image.
-    Color codes boxes:
-      - Green: GOOD
-      - Red: DEFECT
-      - Yellow: UNCERTAIN
-      - Cyan: Detection only (before counting)
-    """
+def classify_result(count, confidence, detection_confidence, defects, expected):
+    if count == "uncertain" or confidence == "low" or detection_confidence == "low":
+        return "UNCERTAIN"
+    if defects or count != expected:
+        return "DEFECT"
+    return "GOOD"
+
+
+def draw_annotated_image(source_image, components, results=None):
     overlay = source_image.copy()
     draw = ImageDraw.Draw(overlay)
-    w, h = source_image.size
-
-    # Choose font size proportional to image height
-    badge_h = max(24, int(h * 0.022))
-    font_size = max(14, int(badge_h * 0.7))
+    w, h = overlay.size
+    font_size = max(16, min(34, int(h*0.018)))
+    line_width = max(3, min(10, int(min(w, h)*0.003)))
     try:
         font = ImageFont.truetype("arial.ttf", font_size)
     except Exception:
         font = ImageFont.load_default()
-
-    line_w = max(4, int(w * 0.003))
-
-    color_map = {
-        "GOOD": ("#10b981", "#065f46"),       # Green outline, dark bg
-        "DEFECT": ("#ef4444", "#991b1b"),     # Red outline, dark bg
-        "UNCERTAIN": ("#f59e0b", "#92400e"),  # Amber outline, dark bg
-        "DETECTED": ("#06b6d4", "#0e7490"),   # Cyan outline, dark bg
+    colors = {
+        "GOOD": ("#10b981", "#065f46"),
+        "DEFECT": ("#ef4444", "#991b1b"),
+        "UNCERTAIN": ("#f59e0b", "#92400e"),
+        "DETECTED": ("#06b6d4", "#0e7490"),
     }
-
     for comp in components:
-        px_box = box_to_pixels(comp["bbox"], w, h)
-        pos = comp.get("position", "")
-
-        status = "DETECTED"
-        if results_dict and pos in results_dict:
-            status = results_dict[pos].get("status", "UNCERTAIN")
-
-        outline_color, badge_bg = color_map.get(status, ("#06b6d4", "#0e7490"))
-
-        # Draw bounding box
-        draw.rectangle(px_box, outline=outline_color, width=line_w)
-
-        # Draw compact label badge at top-left
-        label_text = f" {pos} " if pos else " C "
-        x1, y1 = px_box[0], px_box[1]
-
-        # Ensure label fits within image boundaries
-        text_w = len(label_text) * (font_size * 0.65)
-        badge_box = [x1, max(0, y1 - badge_h), x1 + text_w, max(badge_h, y1)]
-        draw.rectangle(badge_box, fill=badge_bg)
-        draw.text((badge_box[0] + 4, badge_box[1] + 2), label_text, fill="white", font=font)
-
+        px = box_to_pixels(comp["bbox"], w, h)
+        pos = comp["position"]
+        result = (results or {}).get(pos, {})
+        status = result.get("status", "DETECTED")
+        outline, badge = colors.get(status, colors["DETECTED"])
+        draw.rectangle(px, outline=outline, width=line_width)
+        label = pos if not result else f"{pos}: {result.get('strand_count', '?')}"
+        if comp.get("possible_duplicate"):
+            label += " !"
+        tb = draw.textbbox((0, 0), label, font=font)
+        tw, th = tb[2]-tb[0], tb[3]-tb[1]
+        bx = max(0, min(w-tw-12, px[0]))
+        by = max(0, px[1]-th-12)
+        draw.rounded_rectangle((bx, by, min(w, bx+tw+12), min(h, by+th+10)),
+                               radius=4, fill=badge)
+        draw.text((bx+6, by+3), label, fill="white", font=font)
     return overlay
+
+
+def render_matrix(components, results, n_cols):
+    if not components or not results or n_cols < 1:
+        return
+    cards = []
+    for comp in components:
+        pos = comp["position"]
+        result = results.get(pos, {})
+        status = result.get("status", "UNCERTAIN")
+        css = {"GOOD": "card-good", "DEFECT": "card-defect"}.get(status, "card-uncertain")
+        count = result.get("strand_count", "—")
+        cards.append(
+            f'<div class="comp-card {css}"><div class="card-id">{pos}</div>'
+            f'<div class="card-count">{count}</div><div class="card-status">{status}</div></div>'
+        )
+    st.html('<div class="matrix-container"><div class="matrix-grid" '
+            f'style="grid-template-columns:repeat({n_cols}, minmax(110px, 1fr));">'
+            + "".join(cards) + "</div></div>")
 
 
 # -------------------- SIDEBAR --------------------
 with st.sidebar:
     st.header("⚙️ Inspection Configuration")
-    model_name = st.selectbox(
-        "Vision model",
-        options=["gpt-5.4-mini", "gpt-5.6-sol"],
-        index=0,
-    )
-    expected_strands = st.number_input(
-        "Expected strand count per component",
-        min_value=0,
-        max_value=5,
-        value=4,
-        step=1,
-        help="Target strand count. Components with a different count will be marked as DEFECT.",
-    )
-    expected_components = st.number_input(
-        "Expected total components",
-        min_value=1,
-        max_value=30,
-        value=10,
-        step=1,
-        help="Normal arrangement is 10 components (5 rows × 2 columns).",
-    )
-    rotation = st.selectbox(
-        "Manual image rotation",
-        options=[0, 90, 180, 270],
-        index=0,
-        format_func=lambda x: f"{x}°",
-        help="EXIF orientation is applied automatically. Use this if the packet is still tilted.",
-    )
+    model_name = st.text_input("Vision model", value="gpt-5.4-mini",
+                               help="Use a vision-capable model enabled for your API account.")
+    expected_strands = st.number_input("Expected strand count", 0, 5, 4, 1)
+    expected_components = st.number_input("Expected total components", 1, 30, 10, 1)
+    rotation = st.selectbox("Additional image rotation", [0, 90, 180, 270],
+                            format_func=lambda x: f"{x}°")
+    crop_padding = st.slider("Crop padding (%)", 0, 15, 6)
+    show_debug = st.checkbox("Show diagnostic details", False)
 
-
-# -------------------- MAIN INTERFACE --------------------
-uploaded = st.file_uploader(
-    "Upload packet photograph",
-    type=["jpg", "jpeg", "png", "webp"],
-    help="Upload an inspection photo of the packet.",
-)
-
-if not uploaded:
-    st.info("Upload an image above to begin component detection and strand counting.")
+uploaded = st.file_uploader("Upload packet photograph", type=["jpg", "jpeg", "png", "webp"])
+if uploaded is None:
+    st.info("Upload a packet image to begin.")
     st.stop()
 
-# 1. Load image and apply EXIF transpose + optional manual rotation
+raw_bytes = uploaded.getvalue()
+image_hash = hashlib.sha256(raw_bytes + str(rotation).encode()).hexdigest()
 try:
-    source_img = ImageOps.exif_transpose(Image.open(uploaded)).convert("RGB")
+    source_img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw_bytes))).convert("RGB")
     if rotation:
         source_img = source_img.rotate(rotation, expand=True)
 except Exception as exc:
     st.error(f"Could not load image: {exc}")
     st.stop()
 
-# Action buttons
-col_act1, col_act2 = st.columns([1, 1])
-with col_act1:
-    btn_inspect = st.button("🚀 Run Full Inspection", type="primary", width="stretch")
-with col_act2:
-    btn_detect_only = st.button("🔍 Detect Components Only", width="stretch")
+if st.session_state.get("active_image_hash") != image_hash:
+    for key in ("components", "inspection_results", "num_rows", "num_cols",
+                "detection_notes", "layout_warnings", "debug_info"):
+        st.session_state.pop(key, None)
+    st.session_state["active_image_hash"] = image_hash
 
-# Run detection and inspection workflow
-if btn_inspect or btn_detect_only:
-    # Clear prior results
-    st.session_state.pop("inspection_results", None)
-    st.session_state.pop("components", None)
-    st.session_state.pop("num_rows", None)
-    st.session_state.pop("num_cols", None)
+st.caption(f"{uploaded.name} · {source_img.width} × {source_img.height} px")
+col_a, col_b = st.columns(2)
+with col_a:
+    run_full = st.button("🚀 Run Full Inspection", type="primary", use_container_width=True)
+with col_b:
+    run_detection = st.button("🔍 Detect Components Only", use_container_width=True)
 
-    with st.spinner("Step 1/2: Detecting individual components..."):
-        try:
-            det_res = detect_components(model_name, source_img, expected_count=expected_components)
-            raw_comps = det_res["components"]
-            if not raw_comps:
-                st.error("No components could be located in the image. Please verify lighting, framing, and rotation.")
+if run_full or run_detection:
+    for key in ("components", "inspection_results", "num_rows", "num_cols",
+                "detection_notes", "layout_warnings", "debug_info"):
+        st.session_state.pop(key, None)
+    try:
+        with st.spinner("Step 1/2: Detecting components..."):
+            det = detect_components(model_name, source_img, int(expected_components))
+            if not det["components"]:
+                st.error("No valid component boxes were returned. Check image quality and API response.")
                 st.stop()
-
-            # Assign dynamic row and column positions (e.g. R1C1, R1C2...)
-            ordered_comps, n_rows, n_cols = assign_grid_positions(raw_comps)
-            st.session_state["components"] = ordered_comps
+            ordered, n_rows, n_cols, layout_warnings = assign_grid_positions(det["components"])
+            st.session_state["components"] = ordered
             st.session_state["num_rows"] = n_rows
             st.session_state["num_cols"] = n_cols
-            st.session_state["detection_notes"] = det_res.get("notes", "")
+            st.session_state["detection_notes"] = det["notes"]
+            st.session_state["layout_warnings"] = layout_warnings
+            st.session_state["debug_info"] = {
+                "image_dimensions": source_img.size,
+                "detected_count": len(ordered),
+                "rejected_boxes": det["rejected_boxes"],
+                "row_sizes": [sum(c["row"] == r for c in ordered) for r in range(1, n_rows+1)],
+            }
+    except Exception as exc:
+        st.error(f"Component detection failed: {exc}")
+        st.stop()
 
-        except Exception as exc:
-            st.error(f"Component detection failed: {exc}")
-            st.stop()
-
-    if btn_inspect:
-        with st.spinner("Step 2/2: Counting strands for each detected component..."):
-            progress_bar = st.progress(0.0)
-            res_dict = {}
-            w, h = source_img.size
-
-            for i, comp in enumerate(ordered_comps):
-                pos = comp["position"]
-                px_box = box_to_pixels(comp["bbox"], w, h)
-                crop = crop_with_padding(source_img, px_box, padding=0.10)
-
-                try:
-                    c_res = count_single_component(model_name, crop, pos)
-                except Exception as exc:
-                    c_res = {
-                        "strand_count": "uncertain",
-                        "visible_defects": f"API Error: {exc}",
-                        "count_confidence": "low",
-                        "uncertainty_reason": str(exc),
-                    }
-
-                pred_count = c_res["strand_count"]
-                confidence = c_res["count_confidence"]
-                det_conf = comp["detection_confidence"]
-                defects = c_res["visible_defects"]
-
-                # Inspection status determination
-                if pred_count == "uncertain" or confidence == "low" or det_conf == "low":
-                    status = "UNCERTAIN"
-                elif defects.lower() not in ("none", "none visible", "no defects", "n/a", ""):
-                    status = "DEFECT"
-                elif pred_count == expected_strands:
-                    status = "GOOD"
-                else:
-                    status = "DEFECT"
-
-                res_dict[pos] = {
-                    "position": pos,
-                    "row": comp["row"],
-                    "col": comp["col"],
-                    "strand_count": pred_count,
-                    "expected_count": expected_strands,
-                    "status": status,
-                    "defects": defects,
-                    "confidence": confidence,
-                    "detection_confidence": det_conf,
-                    "reason": c_res["uncertainty_reason"],
+    if run_full:
+        results = {}
+        progress = st.progress(0.0)
+        progress_text = st.empty()
+        for i, comp in enumerate(ordered):
+            pos = comp["position"]
+            try:
+                px = box_to_pixels(comp["bbox"], source_img.width, source_img.height)
+                crop = crop_with_padding(source_img, px, crop_padding/100.0)
+                counted = count_single_component(model_name, crop, pos)
+                count, conf, defects = (counted["strand_count"],
+                                        counted["count_confidence"],
+                                        counted["visible_defects"])
+                status = classify_result(count, conf, comp["detection_confidence"],
+                                         defects, int(expected_strands))
+                results[pos] = {
+                    "position": pos, "row": comp["row"], "col": comp["col"],
+                    "strand_count": count, "expected_count": int(expected_strands),
+                    "status": status, "defects": defects, "confidence": conf,
+                    "detection_confidence": comp["detection_confidence"],
+                    "reason": counted["uncertainty_reason"], "crop_dimensions": crop.size,
                 }
-                progress_bar.progress((i + 1) / len(ordered_comps))
+            except Exception as exc:
+                results[pos] = {
+                    "position": pos, "row": comp["row"], "col": comp["col"],
+                    "strand_count": "uncertain", "expected_count": int(expected_strands),
+                    "status": "UNCERTAIN", "defects": [], "confidence": "low",
+                    "detection_confidence": comp["detection_confidence"],
+                    "reason": f"Inspection error: {exc}",
+                }
+            progress.progress((i+1)/len(ordered))
+            progress_text.write(f"Inspected {i+1} of {len(ordered)} components")
+        progress.empty()
+        progress_text.empty()
+        st.session_state["inspection_results"] = results
 
-            progress_bar.empty()
-            st.session_state["inspection_results"] = res_dict
-
-
-# -------------------- DISPLAY SECTION --------------------
-comps = st.session_state.get("components")
-res_dict = st.session_state.get("inspection_results")
+components = st.session_state.get("components")
+results = st.session_state.get("inspection_results")
 n_rows = st.session_state.get("num_rows", 0)
 n_cols = st.session_state.get("num_cols", 0)
 
-if comps:
-    # 1. Annotated full packet image
+if components:
     st.subheader("1. Annotated Packet Image")
-    annotated = draw_annotated_image(source_img, comps, results_dict=res_dict)
-    st.image(annotated, width="stretch")
+    st.image(draw_annotated_image(source_img, components, results), use_container_width=True)
 
-    # Detections validation check
-    det_count = len(comps)
-    if det_count != expected_components:
-        st.warning(
-            f"Detected {det_count} components (expected {expected_components}). "
-            "Please check bounding boxes for any missed or duplicate components."
-        )
+    if len(components) != int(expected_components):
+        st.warning(f"Detected {len(components)} components; expected {int(expected_components)}. "
+                   "Review the boxes before trusting the result.")
+    duplicates = sum(bool(c.get("possible_duplicate")) for c in components)
+    if duplicates:
+        st.warning(f"{duplicates} possible duplicate/overlapping boxes flagged for review.")
+    for warning in st.session_state.get("layout_warnings", []):
+        st.warning(warning)
+    if st.session_state.get("detection_notes"):
+        st.info(st.session_state["detection_notes"])
 
-    # 2. Final Results Display: Colour-Coded Matrix
-    if res_dict:
+    if results:
         st.subheader("2. Final Inspection Matrix")
-
-        # Determine overall status
-        statuses = [item["status"] for item in res_dict.values()]
-        has_uncertain = "UNCERTAIN" in statuses
-        has_defect = "DEFECT" in statuses
-
-        if has_uncertain:
-            st.warning("⚠️ Overall Result: **REVIEW REQUIRED** — One or more components have ambiguous strand counts or low confidence.")
-        elif has_defect:
-            st.error("❌ Overall Result: **DEFECT DETECTED** — One or more components do not meet the expected strand count or have visible defects.")
+        statuses = [v["status"] for v in results.values()]
+        if "UNCERTAIN" in statuses:
+            st.warning("⚠️ Overall result: REVIEW REQUIRED")
+        elif "DEFECT" in statuses:
+            st.error("❌ Overall result: DEFECT DETECTED")
         else:
-            st.success("✅ Overall Result: **ALL COMPONENTS GOOD** — All components match expected strand criteria.")
+            st.success("✅ Overall result: ALL COMPONENTS GOOD")
+        render_matrix(components, results, n_cols)
 
-        # Build clean CSS grid of cards matching rows and columns
-        card_items = []
-        for comp in comps:
-            pos = comp["position"]
-            data = res_dict.get(pos, {})
-            count_val = data.get("strand_count", "—")
-            status = data.get("status", "UNCERTAIN")
-
-            # Card CSS class
-            if status == "GOOD":
-                card_class = "comp-card card-good"
-            elif status == "DEFECT":
-                card_class = "comp-card card-defect"
-            else:
-                card_class = "comp-card card-uncertain"
-
-            count_display = str(count_val).capitalize() if str(count_val) == "uncertain" else str(count_val)
-
-            card_items.append(
-                f'<div class="{card_class}">'
-                f'<div class="card-id">{pos}</div>'
-                f'<div class="card-count">{count_display}</div>'
-                f'<div class="card-status">{status}</div>'
-                f'</div>'
-            )
-
-        matrix_html = (
-            f'<div class="matrix-container">'
-            f'<div class="matrix-grid" style="grid-template-columns: repeat({n_cols}, minmax(130px, 1fr));">'
-            + "".join(card_items)
-            + '</div></div>'
-        )
-        st.html(matrix_html)
-
-        # 3. Downloads (CSV and Markdown)
-        records = list(res_dict.values())
-        df = pd.DataFrame(records)
-
-        # Format markdown table manually to avoid tabulate dependency
-        md_lines = [
-            f"# Packet Strand Inspection Report",
-            f"- **Filename:** {uploaded.name}",
-            f"- **Expected Strand Count:** {expected_strands}",
-            f"- **Overall Result:** {'REVIEW REQUIRED' if has_uncertain else ('DEFECT' if has_defect else 'GOOD')}",
-            "",
-            "| Position | Strand Count | Status | Defects | Confidence |",
-            "| :--- | :--- | :--- | :--- | :--- |",
+        df = pd.DataFrame(list(results.values()))
+        report = [
+            "# Packet Strand Inspection Report",
+            f"- Filename: {uploaded.name}",
+            f"- Image dimensions: {source_img.width} × {source_img.height}",
+            f"- Expected strand count: {expected_strands}",
+            f"- Detected components: {len(components)}", "",
+            "| Position | Count | Expected | Status | Defects | Confidence |",
+            "|---|---:|---:|---|---|---|",
         ]
-        for r in records:
-            md_lines.append(
-                f"| {r['position']} | {r['strand_count']} | {r['status']} | {r['defects']} | {r['confidence']} |"
-            )
-        report_md = "\n".join(md_lines)
+        for r in results.values():
+            report.append(f"| {r['position']} | {r['strand_count']} | {r['expected_count']} | "
+                          f"{r['status']} | {', '.join(r['defects']) or 'none'} | {r['confidence']} |")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button("📥 Download Results CSV", df.to_csv(index=False).encode("utf-8"),
+                               f"inspection_{uploaded.name}.csv", "text/csv",
+                               use_container_width=True)
+        with c2:
+            st.download_button("📥 Download Markdown Report", "\n".join(report),
+                               f"inspection_{uploaded.name}.md", "text/markdown",
+                               use_container_width=True)
+    else:
+        st.info("Components detected. Click Run Full Inspection to count strands.")
 
-        col_d1, col_d2 = st.columns(2)
-        with col_d1:
-            st.download_button(
-                "📥 Download Results CSV",
-                data=df.to_csv(index=False),
-                file_name=f"inspection_{uploaded.name}.csv",
-                mime="text/csv",
-                width="stretch",
-            )
-        with col_d2:
-            st.download_button(
-                "📥 Download Markdown Report",
-                data=report_md,
-                file_name=f"inspection_{uploaded.name}.md",
-                mime="text/markdown",
-                width="stretch",
-            )
-
-    elif not btn_inspect and comps:
-        st.info("Components located. Click **🚀 Run Full Inspection** to count strands and generate the final matrix.")
+    if show_debug:
+        st.subheader("Diagnostic details")
+        st.json(st.session_state.get("debug_info", {}))
+        with st.expander("Detected coordinates"):
+            st.dataframe(pd.DataFrame([{
+                "position": c["position"], "bbox_normalized": c["bbox"],
+                "detection_confidence": c["detection_confidence"],
+                "possible_duplicate": c["possible_duplicate"],
+            } for c in components]), use_container_width=True)
+        if results:
+            with st.expander("Counting diagnostics"):
+                st.dataframe(pd.DataFrame(list(results.values())), use_container_width=True)
