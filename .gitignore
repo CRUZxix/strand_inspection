@@ -25,3 +25,8 @@ Thumbs.db
 
 # Temporary files
 *.tmp
+
+# Regenerable dataset images (rebuild with scripts/01 and 02)
+data_build/crops/
+data_build/processed/
+data_build/contact/

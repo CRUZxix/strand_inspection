@@ -1,210 +1,175 @@
 # Strand Inspection System
-### AI-Assisted Automated Strand Detection and Quality Inspection
+### Fully local computer-vision inspection of strand components in a packet
 
-An image-based inspection system designed to automatically detect components inside a packet, identify their strand counts, and determine whether each component meets the required quality criteria.
+An image-based system that inspects a packet holding **10 components in a 5×2 grid**, counts the strands in each component, and decides whether the packet passes.
 
-The system aims to reduce manual inspection effort by combining computer vision, AI-assisted image analysis, and automated inspection reporting.
+- Each component can have 0–5 strands. **The expected count is 4** (count 4 = GOOD, any other count = DEFECT).
+- The pipeline runs fully **locally**: image processing plus a small CNN (ResNet18). No external vision API is used.
+- An earlier prototype (`app.py`, Streamlit + OpenAI vision) is still in the repo but is **not** part of the local pipeline.
 
 ---
 
-## Project Overview
+## Current status
 
-The Strand Inspection System takes an image of a packet containing multiple strand-based components and performs automated inspection.
+| Phase | Description | Status |
+|---|---|---|
+| 1 | Automatic localisation and cropping of the 10 components | Done |
+| 2 | Preprocessing + packet-level train / CV / test splits | Done |
+| 3 | PyTorch dataset loader (`src/dataset.py`) | Done |
+| 4 | ResNet18 training and evaluation (`scripts/03_train.py`) | Done: 5-fold CV comparison run |
+| 5 | Inference with visual result (`scripts/04_predict.py`) | Working; see limitations |
+| 6 | Local Streamlit app, no API key (`app_local.py`) | Working |
+| – | Final model trained on all CV folds + one-time frozen-test evaluation | **Not done yet** |
+| – | UNCERTAIN threshold tuning, per-belt localiser, error analysis | Planned |
 
-The system is designed to:
+## Dataset
 
-- Identify individual components within a packet.
-- Automatically generate bounding boxes around detected components.
-- Estimate the number of strands in each component.
-- Assign component positions using row and column identification.
-- Classify components as GOOD, DEFECT, or UNCERTAIN.
-- Generate a visual inspection result and a final component-wise inspection matrix.
+67 packets, 670 labelled component crops (`data_build/dataset.csv`; labels are clean: count 4 ⇔ GOOD).
 
-## Key Features
+| Strand count | 0 | 1 | 2 | 3 | 4 | 5 |
+|---|---:|---:|---:|---:|---:|---:|
+| Crops | 10 | 10 | 30 | 45 | 500 | 75 |
 
-| Feature | Description |
+**Splits are by packet, never by crop** (neighbouring crops overlap, so crop-level splitting leaks). The split is frozen in `data_build/splits.json`:
+
+- **Test:** 11 packets / 110 crops (`split == "test"`). Used only once for the final evaluation, never for model selection.
+- **CV:** 56 packets in 5 folds (`cv_fold` 0–4), used for training and validation.
+
+Two preprocessing variants are generated for every crop (576×320):
+
+- `enh`: contrast-stretched, brightness-normalised RGB.
+- `cs3`: CLAHE lightness + Sobel-Feldman edges + yellow-belt mask as 3 channels.
+
+## Pipeline
+
+1. **Localise** (`src/localize.py`): a yellow/orange HSV mask finds the belt block, then a regular overlapping 5×2 grid is laid over it. Boxes are cropped to a fixed aspect ratio.
+2. **Preprocess** (`src/preprocess.py`): `enh` / `cs3` variants.
+3. **Classify**: ResNet18 (ImageNet-pretrained, 6 outputs for counts 0–5) with class-weighted cross-entropy and light augmentation (horizontal flip, small rotation/shift/scale, brightness/contrast jitter).
+4. **Decide**: count 4 = GOOD, other counts = DEFECT, low-confidence = UNCERTAIN. The packet **passes only if all 10 components are GOOD**.
+
+## Scripts
+
+| File | Purpose |
 |---|---|
-| Image Upload | Upload packet images for inspection |
-| Automatic Detection | Identify individual components in the packet |
-| Bounding Boxes | Visualize detected components on the original image |
-| Strand Counting | Estimate the number of strands in each component |
-| Position Identification | Assign row and column identifiers such as R1C1 |
-| Defect Classification | Identify components that do not meet inspection criteria |
-| Inspection Matrix | Display component-wise results in a colour-coded matrix |
-| Visual Reporting | Present inspection results in an easy-to-understand format |
+| `scripts/01_make_crops.py` | Phase 1: crop every packet photo into 10 components and attach labels |
+| `scripts/02_preprocess_split.py` | Phase 2: clean labels, packet-level splits, `enh`/`cs3` preprocessing |
+| `scripts/03_train.py` | Phase 4: train and evaluate ResNet18 |
+| `scripts/04_predict.py` | Inspect a new photo and save an annotated result image |
+| `app_local.py` | Local Streamlit app using the trained model (no API key) |
+| `src/infer.py` | Shared inference + result drawing (`inspect_packet`, `render`) |
+| `scripts/check_low_counts.py` | Helper for reviewing low-count crops |
+| `src/localize.py`, `src/preprocess.py` | Localisation and preprocessing |
+| `src/dataset.py` | PyTorch dataset, split helper, class weights |
 
-## Inspection Workflow
+### Train
 
-The intended inspection workflow consists of the following stages:
+Run from the repo root (the `.venv` needs `torch` and `torchvision`):
 
-1. **Image Acquisition:** Upload an image of the packet.
-2. **Component Detection:** Locate individual components and generate bounding boxes.
-3. **Component Identification:** Assign row and column positions to detected components.
-4. **Strand Counting:** Estimate the number of strands in each component.
-5. **Quality Evaluation:** Compare the predicted count against the configured acceptance criteria.
-6. **Final Inspection:** Generate a colour-coded inspection matrix.
+```powershell
+# one validation fold
+python scripts/03_train.py --variant enh --val-fold 0 --epochs 15
 
-## Final Inspection Output
+# full 5-fold comparison of both variants
+foreach ($v in "enh","cs3") { foreach ($f in 0..4) { python -u scripts/03_train.py --variant $v --val-fold $f --epochs 15 } }
 
-The system presents the results in a component-wise matrix.
+# quick smoke test
+python scripts/03_train.py --variant enh --smoke
 
-Example:
+# final model: train on all CV folds, evaluate the frozen test set ONCE
+python scripts/03_train.py --variant enh --final --epochs <N>
+```
 
-| Component | Strand Count | Status |
-|---|---:|---|
-| R1C1 | 2 | 🔴 DEFECT |
-| R1C2 | 3 | 🟢 GOOD |
-| R1C3 | 3 | 🟢 GOOD |
-| R2C1 | 3 | 🟢 GOOD |
-| R2C2 | 3 | 🟢 GOOD |
-| R2C3 | 3 | 🟢 GOOD |
+The best epoch is chosen by macro-F1 on the validation fold only. Results, history and the model are saved to `runs/phase4/<variant>_val<fold>/` (`metrics.json`, `model.pt`). Metrics: accuracy, macro-F1, per-class recall, confusion matrix, defect recall, false acceptance rate (defect passed as GOOD) and false rejection rate. Training is on CPU.
 
-*Illustrative results only. Actual values are generated from the inspection process.*
+### Inspect a new packet photo
 
-The overall packet is classified as DEFECT DETECTED if one or more components fail the configured inspection criteria.
+```powershell
+python scripts/04_predict.py "path\to\photo.jpg" --open
+```
 
-## Technology Stack
+Saves `runs/predictions/<name>_result.png`: the photo with boxes and predicted counts, plus a 5×2 result matrix with crop thumbnails (green GOOD, red DEFECT, amber UNCERTAIN) and a PACKET PASS / FAIL banner. By default the 5 `enh` fold models are averaged. Pass `--models` to choose specific `model.pt` files and `--conf` to change the UNCERTAIN threshold.
 
-| Technology | Purpose |
-|---|---|
-| Python | Core application development |
-| Streamlit | Interactive web application |
-| OpenAI API | AI-assisted image analysis |
-| Computer Vision | Image processing and component localization |
-| YOLO | Object-detection model experimentation |
-| Pillow / OpenCV | Image processing |
-| Pandas | Dataset and inspection data handling |
+### Local app (no API key)
 
-## Dataset Structure
+```powershell
+python -m streamlit run app_local.py
+```
 
-The project uses a packet inspection dataset containing:
+Upload one or more packet photos in the browser to get the annotated photo, the 5×2 result matrix, a PASS / FAIL verdict and a download button. It runs the trained model entirely offline through `src/infer.py` (`inspect_packet(image, nets)`), which is also what `04_predict.py` uses. The older `app.py` (OpenAI) is unchanged.
 
-- Packet images.
-- Component-level inspection labels.
-- Strand-count information.
-- Row and column positions.
-- GOOD / DEFECT status.
-- Defect-type information.
+If a yellow table or background is detected behind the packet, the localiser switches to a table-rejecting mask automatically.
 
-The current dataset contains 67 packet images and 670 component-level records.
+## Results so far (5-fold CV, validation folds, mean)
 
-### Label Information
+| Metric | `enh` | `cs3` |
+|---|---:|---:|
+| Accuracy | 0.936 | 0.928 |
+| Macro-F1 | 0.726 | 0.673 |
+| Defect recall | 0.922 | 0.915 |
+| False acceptance rate | 0.078 | 0.085 |
+| False rejection rate | 0.045 | 0.039 |
 
-The component-level annotation CSV contains the following fields:
+- `enh` is slightly ahead, but the difference is about the size of the fold-to-fold spread.
+- Counts 2–5 reach recall of about 0.88–0.97 (`enh`). Counts 0 and 1 are weak (about 0.30 and 0.50) and have very few examples, so those numbers are noisy.
+- About 8% of defects are still accepted as GOOD, which is too high for an inspection system. Several true count-0 crops are predicted as 4, which needs checking (localisation or label problems).
+- These are CV validation numbers only. The frozen test set has not been used yet.
 
-| Field | Description |
-|---|---|
-| image_id | Unique image identifier |
-| image_filename | Original image filename |
-| captured_at | Image capture timestamp |
-| row | Component row position |
-| column | Component column position |
-| position | Component position identifier |
-| strand_count | Number of strands |
-| status | GOOD / DEFECT |
-| defect_type | Type of defect, where applicable |
+## Known limitations
 
-## Project Structure
+- **Localisation is approximate.** A regular grid is laid over the belt block rather than detecting each belt, so crops can be off-centre or include neighbouring belts, especially when the two columns are offset. Some training crops have localisation imperfections.
+- **Photos that look unlike the training set** (different angle, lighting, background) may localise badly. Check that the boxes sit on the components before trusting the counts.
+- **The UNCERTAIN threshold (0.6) is a placeholder** and has not been tuned.
+- The fold models used by `04_predict.py` are not the final model.
+
+## Next steps
+
+1. Error analysis of misclassified crops (especially count 0 vs 4) and localisation failures.
+2. A per-belt localiser (connected components in the mask, sorted into 5×2).
+3. Tune the UNCERTAIN threshold on validation folds to reduce the false acceptance rate.
+4. Train the final model on all CV folds and evaluate on the frozen test set once.
+
+## Project structure
 
 ```text
 strand-inspection/
-│
-├── .streamlit/
-│   └── secrets.toml
-│
-├── images/
-│   └── Packet inspection images
-│
-├── runs/
-│   └── Model experiment outputs
-│
-├── app.py
-├── verify_dataset.py
-├── labels.csv
-├── packets.csv
-├── yolo26n.pt
-├── requirements.txt
-├── .gitignore
+├── images/            Original packet photos
+├── data_build/        dataset.csv, splits.json, crops.csv, reports (committed);
+│                      crops/, processed/{enh,cs3}/, contact/ (generated, NOT committed)
+├── src/               localize.py, preprocess.py, dataset.py, infer.py
+├── scripts/           01_make_crops.py, 02_preprocess_split.py, 03_train.py, 04_predict.py
+├── runs/              training outputs and predictions (NOT committed, incl. model.pt files)
+├── labels.csv, packets.csv
+├── app_local.py       Local Streamlit app (trained model, no API key)
+├── app.py             Earlier Streamlit + OpenAI prototype (not part of the local pipeline)
 └── README.md
 ```
 
-*The project structure may evolve as development continues.*
+### What is and isn't in the repository
 
-## Installation and Setup
+The repository holds the code, the original photos, the labels, `dataset.csv` and the frozen `splits.json`. Generated and large files are not committed, so after cloning:
 
-### 1. Clone the Repository
+```powershell
+python scripts/01_make_crops.py          # regenerates data_build/crops
+python scripts/02_preprocess_split.py    # regenerates data_build/processed (do NOT regenerate splits casually)
+python scripts/03_train.py --variant enh --val-fold 0   # trains and writes runs/phase4/... (model.pt)
+```
+
+Trained models (`runs/**/model.pt`) are not in the repository, so `app_local.py` and `04_predict.py` need training first.
+
+## Setup
 
 ```bash
 git clone https://github.com/CRUZxix/strand_inspection.git
-```
-
-### 2. Navigate to the Project
-
-```bash
 cd strand_inspection
-```
-
-### 3. Create a Virtual Environment
-
-```bash
 python -m venv .venv
-```
-
-Activate it on Windows:
-
-```powershell
 .venv\Scripts\activate
+pip install torch torchvision pandas numpy pillow opencv-python streamlit
 ```
 
-### 4. Install Dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-If a requirements file is not yet available, install the dependencies used by the application individually.
-
-### 5. Configure API Credentials
-
-Create a file named `secrets.toml` inside the `.streamlit` directory.
-
-```toml
-OPENAI_API_KEY = "your_api_key_here"
-```
-
-Never commit API keys or private credentials to GitHub.
-
-### 6. Run the Application
-
-```bash
-python -m streamlit run app.py
-```
-
-Open the local application:
-
-```text
-http://localhost:8501
-```
-
-## Development Goals
-
-The project is being developed toward a more reliable automated inspection pipeline.
-
-Planned areas of improvement include:
-
-- Improving component localization and bounding-box accuracy.
-- Developing a dedicated object-detection model for the components.
-- Improving strand-count estimation.
-- Handling reflections, transparent packaging, and image orientation.
-- Improving inspection confidence and uncertainty handling.
-- Evaluating performance using unseen packet images.
-- Improving the final inspection interface and reporting.
+(`streamlit` is needed for `app_local.py`. `openai` is only needed for the legacy `app.py`; that prototype needs an `OPENAI_API_KEY` in `.streamlit/secrets.toml`. Never commit keys.)
 
 ## Repository
 
 GitHub: https://github.com/CRUZxix/strand_inspection
 
-## Author
-
-
-*This project is under active development. Detection and classification performance are subject to ongoing testing and validation.*
+*This project is under active development. Performance figures are from cross-validation and are subject to further testing.*

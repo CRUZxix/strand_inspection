@@ -6,6 +6,7 @@ import re
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -52,6 +53,8 @@ DEFAULT_HINT = (
 )
 DEFECT_TYPES = {"broken_strand", "tangled", "missing_strand", "foreign_material", "other"}
 
+PREP_MODES = ["Raw crop", "Enhanced colour", "Edge map (Sobel-Feldman)", "Colour + edge map"]
+
 
 # -------------------- IMAGE HELPERS --------------------
 def image_to_data_url(image, max_side=2400, quality=95):
@@ -62,18 +65,51 @@ def image_to_data_url(image, max_side=2400, quality=95):
     return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
-def enhance_for_vision(image, gamma=0.65, min_side=1100):
+def enhance_for_vision(image, gamma=0.65, min_side=1100, sharpen=1.5):
     """Brighten dark photos, stretch contrast, sharpen thin edges and upscale small crops."""
     img = ImageOps.autocontrast(image.convert("RGB"), cutoff=1)
     if gamma < 1.0:
         arr = np.asarray(img).astype(np.float32) / 255.0
         img = Image.fromarray((np.power(arr, gamma) * 255).astype(np.uint8))
-    img = ImageEnhance.Sharpness(img).enhance(1.5)
+    if sharpen != 1.0:
+        img = ImageEnhance.Sharpness(img).enhance(sharpen)
     scale = min_side / max(img.size)
     if scale > 1.0:
         img = img.resize((round(img.width * scale), round(img.height * scale)),
                          Image.Resampling.LANCZOS)
     return img
+
+
+def sobel_feldman_view(image, blur=1.2, clip=2.0):
+    """Edge map of a crop: dark lines on white. CLAHE evens out lighting and glare,
+    a light blur suppresses bag wrinkles, Scharr (the optimised Sobel-Feldman kernel)
+    gives the gradient magnitude."""
+    rgb = np.asarray(image.convert("RGB"))
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    light = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8)).apply(lab[..., 0])
+    if blur > 0:
+        light = cv2.GaussianBlur(light, (0, 0), blur)
+    gx = cv2.Scharr(light, cv2.CV_32F, 1, 0)
+    gy = cv2.Scharr(light, cv2.CV_32F, 0, 1)
+    mag = cv2.magnitude(gx, gy)
+    mag = np.clip(mag / max(float(np.percentile(mag, 99.5)), 1e-6), 0, 1)
+    edges = (255 * (1 - mag ** 0.7)).astype(np.uint8)
+    return Image.fromarray(edges).convert("RGB")
+
+
+def make_views(image, mode, gamma, min_side=1100, blur=1.2, clip=2.0):
+    """Turn one crop into a list of (label, PIL image) views to send to the model."""
+    if mode == "Raw crop":
+        return [("original crop", image.convert("RGB"))]
+    uses_edges = mode in ("Edge map (Sobel-Feldman)", "Colour + edge map")
+    # sharpening amplifies bag wrinkles, so skip it when edges are computed
+    enhanced = enhance_for_vision(image, gamma, min_side, sharpen=1.0 if uses_edges else 1.5)
+    if mode == "Enhanced colour":
+        return [("enhanced colour crop", enhanced)]
+    edge = sobel_feldman_view(enhanced, blur, clip)
+    if mode == "Edge map (Sobel-Feldman)":
+        return [("edge map", edge)]
+    return [("enhanced colour crop", enhanced), ("edge map of the same crop", edge)]
 
 
 def parse_json_response(text):
@@ -324,12 +360,17 @@ You are inspecting ONE component from a photograph of a packet, identified as {p
 
 What a component looks like: {hint}
 
+You may receive the component as an enhanced colour crop, as an edge map of the same crop
+(dark thin lines on a white background), or both. In the edge map each strand appears as a
+pair of thin nested curves. Use the edge map to separate the nested layers and the colour
+image, when present, to reject bag wrinkles, glare and reflections.
+
 The crop was cut from a regular grid, so slivers of neighbouring components can appear
 at its top, bottom or side edges. Inspect ONLY the component whose centre is closest to
 the centre of the image. Ignore everything else.
 
 Procedure:
-1. Scan the whole component, esgitpecially where the nested layers converge at the fold. 
+1. Scan the whole component, especially where the nested layers converge at the fold.
 2. List every distinct strand from outermost to innermost, one short entry each, saying
    where you see it. Do not list the same curve twice.
 3. Do not count bag wrinkles, glare, reflections, shadows, or neighbouring components.
@@ -345,15 +386,21 @@ other, and only if clearly visible in this crop.
 """
 
 
-def count_vote(model_name, crop, position, hint, refs, effort):
-    """One independent counting attempt for one component crop."""
+def count_vote(model_name, views, position, hint, refs, effort):
+    """One independent counting attempt for one component.
+    views = list of (label, PIL image); refs = list of (views, known_count)."""
     content = [text_part(COUNT_PROMPT.format(position=position, hint=hint.strip()))]
-    for ref_img, ref_count in refs:
+    for ref_views, ref_count in refs:
         content.append(text_part(
-            f"REFERENCE EXAMPLE: the component centred in this image has exactly {ref_count} strands."))
-        content.append(image_part(ref_img, 1600))
+            f"REFERENCE EXAMPLE: the component centred in the following image(s) "
+            f"has exactly {ref_count} strands."))
+        for label, ref_img in ref_views:
+            content.append(text_part(f"({label})"))
+            content.append(image_part(ref_img, 1600))
     content.append(text_part("TARGET COMPONENT TO INSPECT:" if refs else "Component to inspect:"))
-    content.append(image_part(crop, 1600))
+    for label, img in views:
+        content.append(text_part(f"({label})"))
+        content.append(image_part(img, 1600))
     try:
         data = ask_vision(model_name, content, effort)
     except Exception as exc:
@@ -488,17 +535,29 @@ with st.sidebar:
     loc_mode = st.radio("Localization", ["Colour-mask grid (recommended)", "LLM boxes"])
     overlap = st.slider("Vertical overlap factor", 0.50, 1.00, 0.72, 0.01,
                         help="Loop pitch ÷ loop height. Lower = taller boxes that overlap more.")
+    st.subheader("Preprocessing")
+    prep_mode = st.selectbox(
+        "Image sent to the model", PREP_MODES, index=3,
+        help="Colour + edge map sends both views of each crop. Compare modes on labelled "
+             "packets to see which one counts best.")
+    uses_edges = prep_mode in ("Edge map (Sobel-Feldman)", "Colour + edge map")
+    edge_blur = st.slider("Edge smoothing (σ)", 0.0, 3.0, 1.2, 0.1, disabled=not uses_edges,
+                          help="Higher = fewer wrinkle edges, but thin strand lines may fade.")
+    clahe_clip = st.slider("Local contrast (CLAHE clip)", 1.0, 6.0, 2.0, 0.5,
+                           disabled=not uses_edges,
+                           help="Evens out dark bands and glare before edge detection.")
+    gamma = st.slider("Brighten dark photos (gamma)", 0.40, 1.00, 0.65, 0.05,
+                      help="Lower = brighter. 1.0 disables.")
     st.subheader("Counting")
     n_votes = st.slider("Votes per component", 1, 5, 3,
                         help="Each component is counted several times; disagreement → UNCERTAIN.")
     workers = st.slider("Parallel requests", 1, 10, 5)
     crop_padding = st.slider("Crop padding (%)", 0, 15, 4)
-    gamma = st.slider("Brighten dark photos (gamma)", 0.40, 1.00, 0.65, 0.05,
-                      help="Lower = brighter. 1.0 disables.")
     hint = st.text_area("Component description for the model", value=DEFAULT_HINT, height=170,
                         help="Describe what one strand looks like. Edit this to match your product.")
     with st.expander("Reference examples (optional, strongly recommended)"):
-        st.caption("Upload cropped examples with known strand counts, e.g. one GOOD and one DEFECT.")
+        st.caption("Upload cropped examples with known strand counts, e.g. one GOOD and one DEFECT. "
+                   "They get the same preprocessing as the target crops.")
         ref_files = st.file_uploader("Reference crops", type=["jpg", "jpeg", "png", "webp"],
                                     accept_multiple_files=True, key="refs")
         ref_counts = [st.number_input(f"Strands in {f.name}", 0, 5, int(expected_strands), 1,
@@ -558,30 +617,32 @@ if run_full or run_detection:
                 "components": ordered, "num_rows": n_rows, "num_cols": n_cols,
                 "detection_notes": notes, "layout_warnings": layout_warnings,
                 "debug_info": {"image_dimensions": source_img.size, "detected_count": len(ordered),
-                               "rejected_boxes": rejected, "localization": loc_mode},
+                               "rejected_boxes": rejected, "localization": loc_mode,
+                               "preprocessing": prep_mode},
             })
     except Exception as exc:
         st.error(f"Component localization failed: {exc}")
         st.stop()
 
     if run_full:
-        # Reference examples (few-shot)
+        # Reference examples (few-shot), preprocessed exactly like the target crops
         refs = []
         for f, cnt in zip(ref_files[:4], ref_counts):
             try:
-                refs.append((enhance_for_vision(Image.open(io.BytesIO(f.getvalue())).convert("RGB"),
-                                                gamma, 900), int(cnt)))
+                ref_img = Image.open(io.BytesIO(f.getvalue())).convert("RGB")
+                refs.append((make_views(ref_img, prep_mode, gamma, 900, edge_blur, clahe_clip),
+                             int(cnt)))
             except Exception:
                 pass
 
-        # Prepare crops in the main thread
+        # Prepare crops (and their preprocessed views) in the main thread
         crops, results, tasks = {}, {}, []
         for comp in ordered:
             pos = comp["position"]
             try:
                 px = box_to_pixels(comp["bbox"], source_img.width, source_img.height)
-                crops[pos] = enhance_for_vision(
-                    crop_with_padding(source_img, px, crop_padding / 100.0), gamma)
+                raw_crop = crop_with_padding(source_img, px, crop_padding / 100.0)
+                crops[pos] = make_views(raw_crop, prep_mode, gamma, 1100, edge_blur, clahe_clip)
                 tasks += [(comp, pos) for _ in range(n_votes)]
             except Exception as exc:
                 results[pos] = {
@@ -621,7 +682,8 @@ if run_full or run_detection:
                 "strand_count": agg["strand_count"], "expected_count": int(expected_strands),
                 "status": status, "defects": agg["defects"], "confidence": agg["confidence"],
                 "votes": agg["votes"], "detection_confidence": comp["detection_confidence"],
-                "reason": agg["reason"], "crop_dimensions": crops[pos].size}
+                "reason": agg["reason"], "crop_dimensions": crops[pos][0][1].size,
+                "preprocessing": prep_mode}
         st.session_state["inspection_results"] = results
 
 components = st.session_state.get("components")
@@ -661,7 +723,8 @@ if components:
             f"- Filename: {uploaded.name}",
             f"- Image dimensions: {source_img.width} × {source_img.height}",
             f"- Expected strand count: {expected_strands}",
-            f"- Detected components: {len(components)}", "",
+            f"- Detected components: {len(components)}",
+            f"- Preprocessing: {prep_mode}", "",
             "| Position | Count | Votes | Expected | Status | Defects | Confidence |",
             "|---|---:|---|---:|---|---|---|",
         ]
@@ -692,12 +755,13 @@ if components:
             } for c in components]), use_container_width=True)
         crops_dbg = st.session_state.get("crops")
         if crops_dbg:
-            with st.expander("Crops sent to the model"):
+            with st.expander("Images sent to the model"):
                 cols = st.columns(n_cols or 1)
                 for comp in sorted(components, key=lambda c: (c["col"], c["row"])):
                     if comp["position"] in crops_dbg:
-                        cols[(comp["col"] - 1) % len(cols)].image(
-                            crops_dbg[comp["position"]], caption=comp["position"])
+                        target = cols[(comp["col"] - 1) % len(cols)]
+                        for label, img in crops_dbg[comp["position"]]:
+                            target.image(img, caption=f"{comp['position']} · {label}")
         if results:
             with st.expander("Counting diagnostics"):
                 st.dataframe(pd.DataFrame(list(results.values())), use_container_width=True)
