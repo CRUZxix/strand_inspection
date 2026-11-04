@@ -9,24 +9,25 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 
-from src.infer import default_model_paths, inspect_packet, load_models, render
+from src.infer import inspect_packet, load_classifier, render
 
 st.set_page_config(page_title="Strand Inspection (local)", layout="wide")
 st.title("Strand Inspection (local model)")
 
 
 @st.cache_resource
-def get_models(paths):
-    return load_models(list(paths))
+def get_models():
+    return load_classifier()
 
 
-paths = tuple(default_model_paths())
-if not paths:
-    st.error("No trained model found in runs/phase4/. Run scripts/03_train.py first.")
+try:
+    nets = get_models()
+except Exception as e:
+    st.error(f"No trained model found in runs/phase4/ ({e}). Run scripts/03_train.py first.")
     st.stop()
 
 with st.sidebar:
-    st.caption(f"{len(paths)} model(s) loaded (predictions averaged)")
+    st.caption(f"Model: {type(nets).__name__} (single batched pass)")
     conf = st.slider("UNCERTAIN below confidence", 0.3, 0.95, 0.6, 0.05,
                      help="Placeholder threshold, not yet tuned.")
     st.caption("Expected strand count: 4 (GOOD). Other counts = DEFECT.")
@@ -34,12 +35,12 @@ with st.sidebar:
                "Check the boxes sit on the components before trusting the counts.")
 
 files = st.file_uploader("Packet photo(s)", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
-nets = get_models(paths)
 
 for f in files:
     st.divider()
     with st.spinner(f"Inspecting {f.name}..."):
         out = inspect_packet(Image.open(f), nets, conf)
+    st.caption(f"Inference timing (ms): {out['timing_ms']}")
     (st.success if out["passed"] else st.error)(f"{f.name}: PACKET {'PASS' if out['passed'] else 'FAIL'}")
     if out["table_mode"]:
         st.caption("Yellow background detected: table-rejecting mask used.")

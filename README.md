@@ -19,7 +19,11 @@ An image-based system that inspects a packet holding **10 components in a 5×2 g
 | 4 | ResNet18 training and evaluation (`scripts/03_train.py`) | Done: 5-fold CV comparison run |
 | 5 | Inference with visual result (`scripts/04_predict.py`) | Working; see limitations |
 | 6 | Local Streamlit app, no API key (`app_local.py`) | Working |
-| – | Final model trained on all CV folds + one-time frozen-test evaluation | **Not done yet** |
+| – | Final model trained on all CV folds + one-time frozen-test evaluation | Done (`runs/phase4/enh_final`): test acc 0.936, defect recall 0.964, FAR 0.036 |
+| Live 4 | Mobile PWA + HUD (`web/`) | Done; tested in headless Chromium with a fake camera, **not on a real phone** |
+| Live 3 | FastAPI WebSocket streaming server (`server/app.py`) | Done; tested on localhost only |
+| Live 2 | Blur gate, tracking, multi-frame voting state machine (`src/live.py`) | Done on simulated streams; **not tested on real video** |
+| Live 1 | Single batched forward pass + ONNX INT8 (`runs/phase4/enh_final/model_int8.onnx`) | Done: model stage ~16 ms for 10 crops |
 | – | UNCERTAIN threshold tuning, per-belt localiser, error analysis | Planned |
 
 ## Dataset
@@ -54,6 +58,13 @@ Two preprocessing variants are generated for every crop (576×320):
 | `scripts/01_make_crops.py` | Phase 1: crop every packet photo into 10 components and attach labels |
 | `scripts/02_preprocess_split.py` | Phase 2: clean labels, packet-level splits, `enh`/`cs3` preprocessing |
 | `scripts/03_train.py` | Phase 4: train and evaluate ResNet18 |
+| `scripts/05_export_onnx.py` | Live-system Phase 1: export final model to ONNX (fp32 + INT8), verify parity, benchmark |
+| `src/live.py` | Live engine: blur gate, packet tracker, SEARCHING/LOCKED/INSPECTING/LATCHED voting `Inspector` |
+| `scripts/06_simulate_stream.py` | Simulated handheld video from stills; compares per-frame vs Inspector verdicts |
+| `server/app.py` | FastAPI server: WebSocket `/ws/inspect` (JPEG in, JSON status out), `/health`. Run: `uvicorn server.app:app --host 0.0.0.0 --port 8000` |
+| `scripts/07_ws_client.py` | Test client: streams simulated video to the server and profiles round trip |
+| `web/` | Mobile web app (PWA): rear-camera viewfinder, canvas HUD, torch, haptics/chime, bottom sheet with 5x2 matrix, Freeze/Snapshot |
+| `scripts/08_make_cert.py` | Self-signed HTTPS cert so a phone can use the camera over the LAN (`certs/`, git-ignored) |
 | `scripts/04_predict.py` | Inspect a new photo and save an annotated result image |
 | `app_local.py` | Local Streamlit app using the trained model (no API key) |
 | `src/infer.py` | Shared inference + result drawing (`inspect_packet`, `render`) |
@@ -173,3 +184,17 @@ pip install torch torchvision pandas numpy pillow opencv-python streamlit
 GitHub: https://github.com/CRUZxix/strand_inspection
 
 *This project is under active development. Performance figures are from cross-validation and are subject to further testing.*
+
+## Running the live app
+
+Run from the project folder, using the project's virtual environment (a global `uvicorn` will
+fail with `No module named 'torch'`). PowerShell:
+
+```
+.\.venv\Scripts\python.exe scripts/08_make_cert.py        # once
+.\.venv\Scripts\python.exe -m uvicorn server.app:app --host 0.0.0.0 --port 8443 --ssl-keyfile certs/key.pem --ssl-certfile certs/cert.pem
+```
+Open `https://<PC-LAN-IP>:8443` on the phone (same Wi-Fi), accept the certificate warning once, tap **Start camera**.
+If the phone can't connect, allow Python on *Private networks* in Windows Firewall.
+On the PC itself `http://localhost:8000` also works (localhost counts as secure for the camera):
+`.\.venv\Scripts\python.exe -m uvicorn server.app:app --port 8000`.

@@ -4,8 +4,8 @@ r"""Inspect one NEW packet photo with the trained model(s) and save an annotated
   python scripts/04_predict.py path\to\photo.jpg
   python scripts/04_predict.py photo.jpg --models runs/phase4/enh_val0/model.pt --open
 
-Logic lives in src/infer.py (shared with app_local.py). With several --models (default:
-all enh_val* fold models) softmax is averaged. Component verdict: count 4 = GOOD, other
+Logic lives in src/infer.py (shared with app_local.py). Default model: runs/phase4/enh_final/model_int8.onnx
+(else model.pt, else the legacy enh_val* fold ensemble). Several .pt --models are averaged. Component verdict: count 4 = GOOD, other
 count = DEFECT, max-prob < --conf = UNCERTAIN (threshold NOT yet tuned). Packet PASSES
 only if all 10 are GOOD.
 """
@@ -15,7 +15,8 @@ from pathlib import Path
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.infer import default_model_paths, inspect_packet, load_models, render  # noqa: E402
+from src.infer import (TorchClassifier, inspect_packet, load_classifier, load_models,  # noqa: E402
+                       render)
 
 
 def main():
@@ -27,11 +28,12 @@ def main():
     ap.add_argument("--open", action="store_true", help="open the result image when done")
     a = ap.parse_args()
 
-    paths = a.models or default_model_paths()
-    if not paths:
-        sys.exit("no model.pt found; train first")
-    print(f"using {len(paths)} model(s)")
-    out = inspect_packet(Image.open(a.image), load_models(paths), a.conf)
+    if a.models and all(m.endswith(".pt") for m in a.models):
+        clf = TorchClassifier(load_models(a.models))          # explicit .pt model(s): ensemble if >1
+    else:
+        clf = load_classifier(a.models[0] if a.models else None)  # .onnx, or final model, or legacy folds
+    out = inspect_packet(Image.open(a.image), clf, a.conf)
+    print("timing (ms):", out["timing_ms"])
     print("yellow background detected: table-rejecting mask" if out["table_mode"] else "standard localisation")
 
     print("\ncount matrix (rows x cols):")

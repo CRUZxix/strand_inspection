@@ -3,8 +3,10 @@
 No network / API key needed. Used by scripts/04_predict.py and app_local.py.
 """
 import glob
+import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -13,7 +15,7 @@ from torchvision import models
 from src.dataset import GOOD_CLASS, NUM_CLASSES, make_transform
 from src.localize import (box_to_pixels, crop_fixed_aspect, grid_components,
                           solid_background_present)
-from src.preprocess import make_variants
+from src.preprocess import enhance_rgb
 
 ROOT = Path(__file__).resolve().parents[1]
 W, H = 576, 320
@@ -23,6 +25,12 @@ DEFAULT_MODELS = "runs/phase4/enh_val[0-4]/model.pt"
 
 def default_model_paths():
     return sorted(glob.glob(str(ROOT / DEFAULT_MODELS)))
+
+
+FINAL_MODEL = "runs/phase4/enh_final/model.pt"
+FINAL_ONNX = "runs/phase4/enh_final/model_int8.onnx"
+INPUT_HW = (160, 288)
+_TF = make_transform(False, INPUT_HW)
 
 
 def load_models(paths):
@@ -35,6 +43,54 @@ def load_models(paths):
     return nets
 
 
+class TorchClassifier:
+    """One or more torch nets (ensemble = mean of softmax). probs(batch) -> (N, 6) numpy."""
+
+    def __init__(self, nets):
+        self.nets = nets if isinstance(nets, (list, tuple)) else [nets]
+
+    def probs(self, batch):
+        x = torch.from_numpy(batch)
+        with torch.no_grad():   # ONE forward pass per net for the whole packet
+            return torch.stack([torch.softmax(n(x), 1) for n in self.nets]).mean(0).numpy()
+
+
+class OrtClassifier:
+    """ONNX Runtime session (no PyTorch needed at inference time)."""
+
+    def __init__(self, path, threads=None):
+        import onnxruntime as ort
+        so = ort.SessionOptions()
+        if threads:
+            so.intra_op_num_threads = threads
+        self.sess = ort.InferenceSession(str(path), so, providers=["CPUExecutionProvider"])
+        self.inp = self.sess.get_inputs()[0].name
+
+    def probs(self, batch):
+        logits = self.sess.run(None, {self.inp: batch})[0]
+        e = np.exp(logits - logits.max(1, keepdims=True))
+        return e / e.sum(1, keepdims=True)
+
+
+def load_classifier(path=None):
+    """.onnx -> OrtClassifier; .pt -> single torch net; None -> final .onnx/.pt if present,
+    else the legacy 5-fold ensemble."""
+    if path is None:
+        for cand in (FINAL_ONNX, FINAL_MODEL):
+            if (ROOT / cand).exists():
+                path = ROOT / cand
+                break
+    if path is None:
+        return TorchClassifier(load_models(default_model_paths()))
+    path = Path(path)
+    return OrtClassifier(path) if path.suffix == ".onnx" else TorchClassifier(load_models([path]))
+
+
+def make_batch(crops):
+    """List of PIL crops -> float32 (N, 3, H, W) batch tensor (same preprocessing as training)."""
+    return np.stack([_TF(Image.fromarray(enhance_rgb(c))).numpy() for c in crops])
+
+
 def verdict(pred, conf, thr):
     if conf < thr:
         return "UNCERTAIN"
@@ -42,24 +98,30 @@ def verdict(pred, conf, thr):
 
 
 def inspect_packet(image, nets, conf_thr=0.6):
-    """image: PIL image. Returns dict(results, crops, passed, table_mode, image)."""
+    """image: PIL image. nets: classifier from load_classifier(), or a list of torch nets
+    (legacy). Returns dict(results, crops, passed, table_mode, image, timing_ms)."""
+    clf = nets if hasattr(nets, "probs") else TorchClassifier(nets)
+    t0 = time.perf_counter()
     img = ImageOps.exif_transpose(image).convert("RGB")
     table = solid_background_present(img)   # yellow table behind packet -> mask it out
     comps, _ = grid_components(img, 2, 5, 0.72, split="mid", col_overlap=0.08, reject_solid=table)
-    tf = make_transform(False)
-    results, crops = [], []
-    for c in comps:
-        px = box_to_pixels(c["bbox"], img.width, img.height)
-        crop = crop_fixed_aspect(img, px, W / H, 0.04).resize((W, H), Image.LANCZOS)
-        x = tf(Image.fromarray(make_variants(crop)["enh"])).unsqueeze(0)
-        with torch.no_grad():
-            prob = torch.stack([torch.softmax(n(x), 1)[0] for n in nets]).mean(0)
-        conf, pred = prob.max(0)
-        results.append({**c, "px": px, "pred": int(pred), "conf": float(conf),
-                        "verdict": verdict(int(pred), float(conf), conf_thr)})
-        crops.append(crop)
+    pxs = [box_to_pixels(c["bbox"], img.width, img.height) for c in comps]
+    crops = [crop_fixed_aspect(img, px, W / H, 0.04).resize((W, H), Image.LANCZOS) for px in pxs]
+    t1 = time.perf_counter()
+    batch = make_batch(crops)                # (10, 3, 160, 288)
+    t2 = time.perf_counter()
+    prob = clf.probs(batch)                  # single forward pass for all components
+    t3 = time.perf_counter()
+    results = []
+    for c, px, p in zip(comps, pxs, prob):
+        pred = int(p.argmax()); conf = float(p[pred])
+        results.append({**c, "px": px, "pred": pred, "conf": conf,
+                        "verdict": verdict(pred, conf, conf_thr)})
     passed = all(r["verdict"] == "GOOD" for r in results)
-    return {"results": results, "crops": crops, "passed": passed, "table_mode": table, "image": img}
+    ms = lambda a, b: round((b - a) * 1000, 1)
+    return {"results": results, "crops": crops, "passed": passed, "table_mode": table, "image": img,
+            "timing_ms": {"localize_crop": ms(t0, t1), "preprocess": ms(t1, t2),
+                          "model": ms(t2, t3), "total": ms(t0, t3)}}
 
 
 def _font(size):

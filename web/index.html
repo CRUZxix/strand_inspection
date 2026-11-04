@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#0b0d10">
+<meta name="color-scheme" content="dark">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Strand Inspect</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<style>
+  :root {
+    --bg: #0b0d10; --panel: #14181dee; --line: #2a313a; --text: #eef1f4; --muted: #98a3af;
+    --good: #2fd35c; --bad: #ff4538; --warn: #ffc21a; --accent: #4aa3ff;
+    --tap: 56px;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 16px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow: hidden;
+    overscroll-behavior: none; touch-action: manipulation; }
+  #stage { position: fixed; inset: 0; }
+  video, #freeze, #hud { position: absolute; inset: 0; width: 100%; height: 100%; }
+  video, #freeze { object-fit: contain; background: #000; }  /* whole frame visible: never crop packet edges */
+  #freeze { display: none; }
+  body.frozen #freeze { display: block; } body.frozen video { display: none; }
+
+  /* top status */
+  #top { position: absolute; left: 0; right: 0; top: 0; padding: calc(env(safe-area-inset-top) + 10px) 16px 0;
+    display: flex; gap: 10px; align-items: center; pointer-events: none; }
+  .chip { background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 8px 14px;
+    font-weight: 600; font-size: 15px; display: flex; align-items: center; gap: 8px; backdrop-filter: blur(8px); }
+  #hint { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--bad); flex: none; }
+  .dot.on { background: var(--good); }
+  #stats { font-variant-numeric: tabular-nums; color: var(--muted); font-weight: 500; font-size: 13px; }
+
+  /* verdict banner */
+  #banner { position: absolute; left: 16px; right: 16px; top: calc(env(safe-area-inset-top) + 66px);
+    text-align: center; font-size: 44px; font-weight: 800; letter-spacing: .06em; padding: 10px 0;
+    border-radius: 16px; display: none; border: 3px solid currentColor; background: #000b; pointer-events: none; }
+  #banner.PASS { color: var(--good); display: block; } #banner.FAIL { color: var(--bad); display: block; }
+  #banner.UNCERTAIN { color: var(--warn); display: block; font-size: 30px; }
+
+  /* bottom sheet */
+  #sheet { position: absolute; left: 0; right: 0; bottom: 0; background: var(--panel); border-top: 1px solid var(--line);
+    border-radius: 22px 22px 0 0; backdrop-filter: blur(12px); padding: 8px 16px calc(env(safe-area-inset-bottom) + 14px);
+    transition: transform .25s ease; }
+  #grab { width: 100%; height: 26px; display: flex; justify-content: center; align-items: center; border: 0; background: none; }
+  #grab i { width: 44px; height: 5px; border-radius: 3px; background: #4a5461; }
+  #actions { display: grid; grid-template-columns: 1fr 1.3fr 1fr; gap: 10px; }
+  button.act { height: var(--tap); border-radius: 16px; border: 1px solid var(--line); background: #1d232a; color: var(--text);
+    font: 600 16px system-ui, sans-serif; display: flex; align-items: center; justify-content: center; gap: 8px; }
+  button.act:active { background: #2a323b; }
+  button.act[aria-pressed="true"] { background: #3a3000; border-color: var(--warn); color: var(--warn); }
+  button.act:disabled { opacity: .4; }
+  button#shutter { background: var(--accent); border-color: var(--accent); color: #031526; font-size: 17px; }
+  body.frozen button#shutter { background: var(--warn); border-color: var(--warn); color: #241a00; }
+  #detail { overflow: hidden; max-height: 0; transition: max-height .25s ease; }
+  body.open #detail { max-height: 56vh; }
+  #matrix { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 14px; }
+  .cell { border: 2px solid var(--line); border-radius: 12px; padding: 8px 12px; display: flex; justify-content: space-between;
+    align-items: baseline; background: #10151a; min-height: 52px; }
+  .cell b { font-size: 24px; } .cell small { color: var(--muted); font-size: 12px; display: block; }
+  .cell.GOOD { border-color: var(--good); } .cell.DEFECT { border-color: var(--bad); background: #2a1210; }
+  .cell.UNCERTAIN, .cell.ALIGNING { border-color: var(--warn); }
+  #msg { color: var(--muted); font-size: 13px; margin: 10px 2px 0; min-height: 18px; }
+
+  /* start overlay */
+  #start { position: absolute; inset: 0; background: var(--bg); display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 18px; padding: 24px; text-align: center; z-index: 10; }
+  #start h1 { margin: 0; font-size: 26px; } #start p { margin: 0; color: var(--muted); max-width: 32ch; }
+  #start button { height: 64px; padding: 0 36px; border-radius: 18px; border: 0; background: var(--accent); color: #031526;
+    font: 700 19px system-ui, sans-serif; }
+  #err { color: var(--bad); max-width: 34ch; min-height: 20px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="cam" playsinline muted autoplay></video>
+  <canvas id="freeze"></canvas>
+  <canvas id="hud"></canvas>
+</div>
+
+<div id="top">
+  <div class="chip"><span class="dot" id="dot"></span><span id="hint">Starting…</span></div>
+  <div class="chip" id="stats">– ms</div>
+</div>
+<div id="banner" role="status" aria-live="polite"></div>
+
+<section id="sheet" aria-label="Inspection details">
+  <button id="grab" aria-label="Show or hide details" aria-expanded="false"><i></i></button>
+  <div id="actions">
+    <button class="act" id="torch" aria-pressed="false" disabled>🔦 Torch</button>
+    <button class="act" id="shutter">📷 Freeze</button>
+    <button class="act" id="reset">↺ Reset</button>
+  </div>
+  <div id="detail">
+    <div id="matrix"></div>
+    <div id="msg"></div>
+  </div>
+</section>
+
+<div id="start">
+  <h1>Strand Inspect</h1>
+  <p>Point the rear camera at the packet. Hold steady until the verdict locks.</p>
+  <button id="go">Start camera</button>
+  <div id="err" role="alert"></div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
