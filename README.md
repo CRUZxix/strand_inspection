@@ -148,7 +148,10 @@ strand-inspection/
 │                      crops/, processed/{enh,cs3}/, contact/ (generated, NOT committed)
 ├── src/               localize.py, preprocess.py, dataset.py, infer.py
 ├── scripts/           01_make_crops.py, 02_preprocess_split.py, 03_train.py, 04_predict.py
-├── runs/              training outputs and predictions (NOT committed, incl. model.pt files)
+├── runs/phase4/enh_final/  FINAL trained model (committed): model.pt, model_fp32.onnx, model_int8.onnx
+│                      (other runs/ outputs are NOT committed)
+├── server/, web/      Live inspection server (FastAPI WebSocket) and mobile web app
+├── requirements.txt   Python dependencies
 ├── labels.csv, packets.csv
 ├── app_local.py       Local Streamlit app (trained model, no API key)
 ├── app.py             Earlier Streamlit + OpenAI prototype (not part of the local pipeline)
@@ -165,7 +168,7 @@ python scripts/02_preprocess_split.py    # regenerates data_build/processed (do 
 python scripts/03_train.py --variant enh --val-fold 0   # trains and writes runs/phase4/... (model.pt)
 ```
 
-Trained models (`runs/**/model.pt`) are not in the repository, so `app_local.py` and `04_predict.py` need training first.
+**The final trained model IS in the repository** (`runs/phase4/enh_final/`: `model.pt`, `model_fp32.onnx`, `model_int8.onnx`, about 100 MB total), so the live server, `app_local.py` and `04_predict.py` run straight after cloning with no training. The per-fold CV models (`runs/phase4/enh_val*/`, `cs3_*`) are not committed; retrain them with `03_train.py` only if you need them.
 
 ## Setup
 
@@ -173,11 +176,11 @@ Trained models (`runs/**/model.pt`) are not in the repository, so `app_local.py`
 git clone https://github.com/CRUZxix/strand_inspection.git
 cd strand_inspection
 python -m venv .venv
-.venv\Scripts\activate
-pip install torch torchvision pandas numpy pillow opencv-python streamlit
+# Windows: .venv\Scriptsctivate     Linux/macOS: source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-(`streamlit` is needed for `app_local.py`. `openai` is only needed for the legacy `app.py`; that prototype needs an `OPENAI_API_KEY` in `.streamlit/secrets.toml`. Never commit keys.)
+(`openai` is only needed for the legacy `app.py`, which needs an `OPENAI_API_KEY` in `.streamlit/secrets.toml`. Never commit keys.)
 
 ## Repository
 
@@ -185,16 +188,23 @@ GitHub: https://github.com/CRUZxix/strand_inspection
 
 *This project is under active development. Performance figures are from cross-validation and are subject to further testing.*
 
-## Running the live app
+## Running the live app (server / cloud)
 
-Run from the project folder, using the project's virtual environment (a global `uvicorn` will
-fail with `No module named 'torch'`). PowerShell:
+The live system loads `runs/phase4/enh_final/model_int8.onnx` (falls back to `model.pt`) via `src/infer.py`; both ship in the repo. Inference is CPU-only (about 16 ms for the 10 crops), so no GPU is needed.
 
+```bash
+pip install -r requirements.txt
+python -m uvicorn server.app:app --host 0.0.0.0 --port 8000
 ```
-.\.venv\Scripts\python.exe scripts/08_make_cert.py        # once
-.\.venv\Scripts\python.exe -m uvicorn server.app:app --host 0.0.0.0 --port 8443 --ssl-keyfile certs/key.pem --ssl-certfile certs/cert.pem
+
+- Health check: `GET /health`. Inspection socket: `WS /ws/inspect` (JPEG frames in, JSON status out). The mobile web app in `web/` is served by the same process at `/`.
+- **The phone camera only works over HTTPS** (or localhost). On a cloud host, terminate TLS in front of the app (reverse proxy / platform HTTPS) and make sure WebSocket upgrades are allowed. For direct HTTPS without a proxy, generate a self-signed cert and pass it to uvicorn:
+
+```bash
+python scripts/08_make_cert.py      # writes certs/ (git-ignored)
+python -m uvicorn server.app:app --host 0.0.0.0 --port 8443 --ssl-keyfile certs/key.pem --ssl-certfile certs/cert.pem
 ```
-Open `https://<PC-LAN-IP>:8443` on the phone (same Wi-Fi), accept the certificate warning once, tap **Start camera**.
-If the phone can't connect, allow Python on *Private networks* in Windows Firewall.
-On the PC itself `http://localhost:8000` also works (localhost counts as secure for the camera):
-`.\.venv\Scripts\python.exe -m uvicorn server.app:app --port 8000`.
+
+- Windows local use: run from the project folder with the project venv (`.\.venv\Scripts\python.exe -m uvicorn ...`); a global `uvicorn` fails with `No module named 'torch'`. Open `https://<PC-LAN-IP>:8443` on the phone (same Wi-Fi), accept the certificate warning once, tap **Start camera**. If the phone can't connect, allow Python on *Private networks* in Windows Firewall.
+- If you retrain, regenerate the ONNX files with `python scripts/05_export_onnx.py`.
+- Known: tested on localhost and headless Chromium only; not yet on a real phone or real video.

@@ -15,7 +15,11 @@ env/
 .env.*
 
 # Generated model outputs
-runs/
+# Training outputs are ignored, except the final deployed model
+runs/*
+!runs/phase4/
+runs/phase4/*
+!runs/phase4/enh_final/
 *.log
 
 # OS/editor files

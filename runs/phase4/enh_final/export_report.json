@@ -1,0 +1,24 @@
+{
+ "torch_fp32": {
+  "median_ms": 93.15455000614747,
+  "p95_ms": 103.0088299885392
+ },
+ "onnx_fp32": {
+  "size_mb": 44.7,
+  "argmax_agreement": 1.0,
+  "good_vs_defect_agreement": 1.0,
+  "max_abs_prob_diff": 5.960464477539062e-07,
+  "median_ms": 49.11169997649267,
+  "p95_ms": 51.56348000455182
+ },
+ "onnx_int8": {
+  "size_mb": 11.3,
+  "argmax_agreement": 1.0,
+  "good_vs_defect_agreement": 1.0,
+  "max_abs_prob_diff": 0.03563982993364334,
+  "median_ms": 15.913850016659126,
+  "p95_ms": 16.656859987415373
+ },
+ "n_parity_crops": 400,
+ "parity_split": "cv"
+}

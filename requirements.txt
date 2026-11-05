@@ -1,0 +1,12 @@
+numpy
+pandas
+pillow
+opencv-python
+torch
+torchvision
+onnx
+onnxruntime
+fastapi
+uvicorn[standard]
+cryptography
+streamlit
