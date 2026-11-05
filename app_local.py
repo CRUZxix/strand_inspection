@@ -34,14 +34,24 @@ with st.sidebar:
     st.warning("Assumes an upright 2-column x 5-row packet; always reports 10 components. "
                "Check the boxes sit on the components before trusting the counts.")
 
-files = st.file_uploader("Packet photo(s)", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
+input_mode = st.radio("Input mode", ["📷 Live Camera", "📁 File Upload"], horizontal=True)
 
-for f in files:
+images_to_process = []
+if input_mode == "📷 Live Camera":
+    camera_photo = st.camera_input("Point camera at packet and snap")
+    if camera_photo:
+        images_to_process.append(("camera_capture.jpg", camera_photo))
+else:
+    files = st.file_uploader("Packet photo(s)", type=["jpg", "jpeg", "png"], accept_multiple_files=True)
+    if files:
+        images_to_process.extend([(f.name, f) for f in files])
+
+for name, f in images_to_process:
     st.divider()
-    with st.spinner(f"Inspecting {f.name}..."):
+    with st.spinner(f"Inspecting {name}..."):
         out = inspect_packet(Image.open(f), nets, conf)
     st.caption(f"Inference timing (ms): {out['timing_ms']}")
-    (st.success if out["passed"] else st.error)(f"{f.name}: PACKET {'PASS' if out['passed'] else 'FAIL'}")
+    (st.success if out["passed"] else st.error)(f"{name}: PACKET {'PASS' if out['passed'] else 'FAIL'}")
     if out["table_mode"]:
         st.caption("Yellow background detected: table-rejecting mask used.")
     st.image(render(out), use_container_width=True)
@@ -53,4 +63,4 @@ for f in files:
                  use_container_width=True)
     buf = io.BytesIO(); render(out).save(buf, "PNG")
     st.download_button("Download result image", buf.getvalue(),
-                       file_name=f"{f.name.rsplit('.', 1)[0]}_result.png", mime="image/png", key=f"dl_{f.name}")
+                       file_name=f"{name.rsplit('.', 1)[0]}_result.png", mime="image/png", key=f"dl_{name}")
