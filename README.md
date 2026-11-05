@@ -132,6 +132,28 @@ If a yellow table or background is detected behind the packet, the localiser swi
 - **The UNCERTAIN threshold (0.6) is a placeholder** and has not been tuned.
 - The fold models used by `04_predict.py` are not the final model.
 
+### Data and model
+
+- **Small dataset.** Only 67 packets / 670 crops, and the test set is just 11 packets / 110 crops, so metrics have wide error bars.
+- **Heavy class imbalance.** 500 of 670 crops are count 4. Counts 0 and 1 have only 10 examples each; their recall (about 0.30 and 0.50) is unreliable.
+- **False acceptance is still too high.** Final model: defect recall 0.964, FAR 0.036 on the frozen test set (CV mean FAR about 0.08). Some defects, including true count-0 crops, are still passed as GOOD. This is not yet safe to use as the sole quality gate.
+- **Fixed expected count.** Count 4 = GOOD is hard-coded; other products need retraining and config changes.
+- **Narrow capture conditions.** The model has seen one packet type, belt colour and imaging setup. Other angles, lighting, backgrounds or packet layouts are untested.
+- **Yellow-background sensitivity.** Localisation relies on a yellow/orange HSV mask; yellow tables or backgrounds can break it (a table-rejecting mask is used as a fallback).
+- **CPU-only training**, so experiments are slow and the hyperparameter search was limited.
+
+### Live inspection system
+
+- **Not validated on real video or a real phone.** The mobile PWA was tested only in headless Chromium with a fake camera; the temporal state machine (blur gate, tracking, voting) was tested only on streams simulated from still photos.
+- **Server tested on localhost only.** Latency, throughput and reliability over a real network or cloud deployment have not been measured.
+- **HTTPS required for the camera.** Phones need a secure origin, so LAN use needs the self-signed cert (`scripts/08_make_cert.py`), which triggers browser warnings.
+- **Single packet at a time.** The tracker assumes one packet in view; multiple packets or partial packets are not handled.
+- **INT8 quantisation** was checked for parity on the available data only; small accuracy differences versus fp32 may exist.
+
+### Legacy code
+
+- `app.py` (Streamlit + OpenAI vision) is an earlier prototype that needs an API key and is not part of the local pipeline.
+
 ## Next steps
 
 1. Error analysis of misclassified crops (especially count 0 vs 4) and localisation failures.
